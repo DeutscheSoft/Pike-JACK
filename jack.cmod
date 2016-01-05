@@ -10,7 +10,6 @@
 #include "array.h"
 #include "bignum.h"
 #include "module_support.h"
-#include "modules/_Stdio/buffer.h"
 
 #define DEFAULT_CMOD_STORAGE static
 
@@ -215,7 +214,6 @@ PIKECLASS Client
         return get_storage(loc.o, Client_program);
     }
 
-    PIKE_UNUSED_ATTRIBUTE
     static jack_client_t *find_client_handle() {
         jack_client_t *client;
         struct Client_struct *c = find_client_struct();
