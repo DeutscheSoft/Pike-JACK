@@ -1,0 +1,81 @@
+#pike __REAL_VERSION__
+#require constant(@module@)
+
+//! @ignore
+inherit @module@;
+//! @endignore
+
+string describe_status(int status) {
+    array(string) ret = ({ });
+
+#define CASE(x) if (status & x) ret += ({ #x })
+    CASE(JackFailure);
+    CASE(JackInvalidOption);
+    CASE(JackNameNotUnique);
+    CASE(JackServerStarted);
+    CASE(JackServerFailed);
+    CASE(JackServerError);
+    CASE(JackNoSuchClient);
+    CASE(JackLoadFailure);
+    CASE(JackInitFailure);
+    CASE(JackShmFailure);
+    CASE(JackVersionError);
+    CASE(JackBackendError);
+    CASE(JackClientZombie);
+#undef CASE
+
+    return ret * "|";
+}
+
+string describe_midi_message_code(int ev) {
+#define CASE(x) case x: return #x
+    switch (ev) {
+    CASE(NoteOff);
+    CASE(NoteOn);
+    CASE(PolyphonicKeyPressure);
+    CASE(ControlChange);
+    CASE(ProgramChange);
+    CASE(ChannelPressure);
+    CASE(PitchBend);
+    CASE(SystemExclusive);
+    }
+#undef CASE
+
+    return sprintf("<unknown %x>", ev);
+}
+
+string describe_midi_event(array ev) {
+    return sprintf("%s[%s]", describe_midi_message_code(ev[0]), ((array(string))ev[1..])*", ");
+}
+
+class OpenError {
+    inherit Error.Generic;
+
+    constant error_type = "jack_open";
+    constant is_jack_open_error = 1;
+
+    int status;
+
+    protected void create(int status, void|array bt) {
+        this_program::status = status;
+        ::create(sprintf("Creating JACK client failed: %s\n", describe_status(status)), bt);
+    }
+}
+
+void open_error(int status) {
+    throw(OpenError(status, backtrace()[..<1]));
+}
+
+//!
+enum MidiMessageCodes {
+    NoteOff = 0x80,
+    NoteOn  = 0x90,
+    PolyphonicKeyPressure = 0xa0,
+    ControlChange = 0xb0,
+    ProgramChange = 0xc0,
+    ChannelPressure = 0xd0,
+    PitchBend = 0xe0,
+    SystemExclusive = 0xf0,
+};
+
+//! @appears JACK module

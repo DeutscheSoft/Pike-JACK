@@ -1,0 +1,19 @@
+
+@make_variables@
+
+VPATH=@srcdir@
+MODULE_LDFLAGS=@LDFLAGS@ @LIBS@
+CONFIG_HEADERS=@CONFIG_HEADERS@
+
+MODNAME=JACK
+MODULE_PMOD_IN=$(SRCDIR)/JACK.pmod.in
+MODULE_WRAPPER_PREFIX=_
+OBJS=jack.o
+
+PRECOMPILER_ARGS="--base="
+
+@dynamic_module_makefile@
+
+msgpack.o : $(SRCDIR)/jack.c $(SRCDIR)/jack_port.H $(SRCDIR)/jack_midi_port.H
+
+@dependencies@

@@ -1,0 +1,9 @@
+AC_INIT(jack.cmod)
+AC_MODULE_INIT()
+
+AC_CONFIG_HEADER(jack_config.h)
+
+AC_CHECK_HEADERS(jack/jack.h)
+AC_CHECK_LIB(jack, jack_client_open)
+
+AC_OUTPUT(Makefile, echo FOO >stamp-h)

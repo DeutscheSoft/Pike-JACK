@@ -1,0 +1,556 @@
+#include "global.h"
+#include "cyclic.h"
+#include "pike_memory.h"
+#include "interpret.h"
+#include "pike_float.h"
+#include "pike_types.h"
+#include "bitvector.h"
+#include "builtin_functions.h"
+#include "mapping.h"
+#include "array.h"
+#include "bignum.h"
+#include "module_support.h"
+#include "modules/_Stdio/buffer.h"
+
+#define DEFAULT_CMOD_STORAGE static
+
+#include "jack_config.h"
+
+#if defined(HAVE_JACK_JACK_H) && defined(HAVE_LIBJACK)
+
+#include <errno.h>
+#include <jack/jack.h>
+#include <jack/ringbuffer.h>
+#include <jack/midiport.h>
+
+/*! @module JACK */
+
+typedef jack_nframes_t (*port_processing_cb)(jack_nframes_t,void*);
+
+struct port_handler {
+    port_processing_cb cb;
+    void *arg;
+    struct port_handler *next;
+};
+
+struct midi_event {
+    unsigned char control;
+    unsigned char data[2];
+};
+
+PIKECLASS Client
+    program_flags PROGRAM_USES_PARENT|PROGRAM_NEEDS_PARENT;
+{
+    CVAR jack_client_t *handle;
+    CVAR size_t num_ports;
+    CVAR struct port_handler * ports;
+    CVAR MUTEX_T ports_lock;
+    CVAR COND_T reader_cond;
+
+    INIT {
+        THIS->handle = NULL;
+        THIS->num_ports = 0;
+        THIS->ports = NULL;
+        mt_init(&THIS->ports_lock);
+        co_init(&THIS->reader_cond);
+    }
+
+    EXIT {
+        if (THIS->handle) {
+            jack_client_close(THIS->handle);
+        }
+        if (THIS->ports) {
+            /* TODO: leak but this should not happen */
+            free(THIS->ports);
+        }
+        mt_destroy(&THIS->ports_lock);
+        co_destroy(&THIS->reader_cond);
+    }
+
+    static struct port_handler *client_add_port(struct Client_struct *c, port_processing_cb cb, void* arg) {
+        struct port_handler *port = xmalloc(sizeof(struct port_handler));
+
+        port->cb = cb;
+        port->arg = arg;
+
+        mt_lock(&c->ports_lock);
+
+        port->next = c->ports;
+        c->ports = port;
+
+        mt_unlock(&c->ports_lock);
+
+        return port;
+    }
+
+    static void client_remove_port(struct Client_struct *c, struct port_handler *handler) {
+        struct port_handler **slot;
+
+        mt_lock(&c->ports_lock);
+
+        slot = &c->ports;
+
+        while (*slot) {
+            if (*slot == handler) {
+                *slot = handler->next;
+                free(handler);
+                return;
+            }
+
+            slot = &((*slot)->next);
+        }
+
+        mt_unlock(&c->ports_lock);
+    }
+
+    static int client_processing(jack_nframes_t nframes, void *arg) {
+        struct Client_struct *c = arg;
+        struct port_handler *port;
+        int got_events = 0;
+        
+        mt_lock(&c->ports_lock);
+
+        port = c->ports;
+
+        while (port) {
+            if (port->cb(nframes, port->arg) > 0) got_events = 1;
+            port = port->next;
+        }
+
+        mt_unlock(&c->ports_lock);
+
+        if (got_events) co_broadcast(&c->reader_cond);
+
+        return 0;
+    }
+
+    PIKEFUN void create(string client_name, void|int options, void|string server_name) {
+        jack_status_t status;
+        jack_options_t op = JackNullOption;
+        jack_client_t *handle;
+        const char *cname;
+        const char *sname;
+
+        cname = client_name->str;
+        /* TODO:
+         *  - check client name length
+         */
+
+        if (server_name) {
+            sname = server_name->str;
+            op |= JackServerName;
+            handle = jack_client_open(cname, op, &status, sname);
+        } else {
+            handle = jack_client_open(cname, op, &status);
+        }
+
+        if (!handle) {
+            struct external_variable_context loc;
+            loc.o = Pike_fp->current_object;
+            loc.inherit = Pike_fp->context;
+
+            find_external_context(&loc, 1);
+
+            push_int(status);
+            
+            apply( loc.o, "open_error", 1 );
+        }
+
+        THIS->handle = handle;
+        jack_set_process_callback(handle, client_processing, THIS);
+    }
+
+    PIKEFUN void activate() {
+        if (jack_activate(THIS->handle))
+            Pike_error("Failed to activate.\n");
+    }
+
+    PIKEFUN void deactivate() {
+        if (jack_deactivate(THIS->handle))
+            Pike_error("Failed to deactivate.\n");
+    }
+
+    PIKEFUN void destroy(int reason) {
+        co_broadcast(&THIS->reader_cond);
+    }
+
+    PIKEFUN void wait() {
+        SWAP_OUT_CURRENT_THREAD();
+        co_wait_interpreter(&THIS->reader_cond);
+        SWAP_IN_CURRENT_THREAD();
+    }
+
+    PIKEFUN float cpu_load() {
+        push_float(jack_cpu_load(THIS->handle));
+    }
+
+    PIKEFUN int(0..) sample_rate() {
+        push_int(jack_get_sample_rate(THIS->handle));
+    }
+
+    PIKEFUN array(string) get_ports() {
+        const char **ports = jack_get_ports(THIS->handle, NULL, NULL, 0);
+        size_t i = 0;
+
+        if (ports) {
+            for (; ports[i]; i++) {
+                push_text(ports[i]);
+            }
+
+            jack_free(ports);
+        }
+
+        f_aggregate(i);
+    }
+
+    static struct Client_struct *find_client_struct() {
+        struct external_variable_context loc;
+        jack_client_t *client;
+        struct Client_struct *c;
+        loc.o = Pike_fp->current_object;
+        loc.inherit = Pike_fp->context;
+        loc.parent_identifier = Pike_fp->fun;
+
+        find_external_context(&loc, 1);
+        return get_storage(loc.o, Client_program);
+    }
+
+    PIKE_UNUSED_ATTRIBUTE
+    static jack_client_t *find_client_handle() {
+        jack_client_t *client;
+        struct Client_struct *c = find_client_struct();
+
+        if (c) return c->handle;
+
+        return NULL;
+    }
+
+    PIKECLASS Port
+        program_flags PROGRAM_USES_PARENT|PROGRAM_NEEDS_PARENT;
+    {
+        CVAR jack_port_t *port;
+        CVAR jack_client_t *client;
+
+        PIKEFUN void create(string port_name) {
+            jack_port_t *port;
+            struct Client_struct *c = find_client_struct();
+            jack_client_t *client = c->handle;
+
+            if (!client) Pike_error("Cannot create port in disconnected client.\n");
+
+            port = jack_port_by_name(client, port_name->str);
+
+            if (!port) Pike_error("Could not find port.\n");
+
+            THIS->port = port;
+            THIS->client = client;
+        }
+
+#cmod_include "jack_port.H"
+    }
+
+    PIKECLASS MidiOut
+        program_flags PROGRAM_USES_PARENT|PROGRAM_NEEDS_PARENT;
+    {
+        CVAR jack_port_t *port;
+        CVAR jack_client_t *client;
+        CVAR jack_ringbuffer_t *rb;
+        CVAR struct port_handler *port_handle;
+
+#cmod_include "jack_midi_port.H"
+
+        static jack_nframes_t midi_out_processing(jack_nframes_t nframes, void *arg) {
+            struct Client_MidiOut_struct *P = arg;
+            void *port_buffer = jack_port_get_buffer(P->port, nframes);
+            struct midi_event ev;
+
+            jack_midi_clear_buffer(port_buffer);
+
+            while (jack_ringbuffer_peek(P->rb, (char*)&ev, sizeof(ev)) == sizeof(ev)) {
+                size_t n;
+                int e;
+
+                switch (ev.control & 0xf0) {
+                    case 0x80: // note on
+                    case 0x90: // note off
+                    case 0xa0: // polyphonic key pressure
+                    case 0xb0: // control change
+                    case 0xe0: // pitch bend
+                        n = 3;
+                        break;
+                    case 0xc0: // program change
+                    case 0xd0: // channel pressure
+                        n = 2;
+                        break;
+                    case 0xf0: // system exclusive
+                        n = 1;
+                        break;
+                    default:
+                        /* TODO: proper error handling */
+                        fprintf(stderr, "Bad midi event.\n");
+                        jack_ringbuffer_read_advance(P->rb, sizeof(ev));
+                        continue;
+                }
+                
+                e = jack_midi_event_write(port_buffer, 0, (jack_midi_data_t*)&ev, n);
+
+                /* handle only buffer overflow */
+                if (e) break;
+                jack_ringbuffer_read_advance(P->rb, sizeof(ev));
+            }
+
+            return 0;
+        }
+
+        PIKEFUN void create(string port_name, void|int flags, void|int(0..) buffer_size) {
+            jack_port_t *port;
+            struct Client_struct *c = find_client_struct();
+            jack_client_t *client = c->handle;
+
+            if (!THIS->rb) Pike_error("Out of memory.\n");
+
+            if (!client) Pike_error("Cannot create port in disconnected client.\n");
+
+            port = jack_port_register(client, port_name->str, JACK_DEFAULT_MIDI_TYPE,
+                                      JackPortIsOutput, buffer_size ? buffer_size->u.integer : 0);
+
+            if (!port) Pike_error("Failed to create port.\n");
+
+            THIS->port = port;
+            THIS->client = client;
+            THIS->port_handle = client_add_port(c, midi_out_processing, THIS);
+        }
+
+        PIKEFUN void write(array event) {
+            struct midi_event ev;
+            ptrdiff_t i;
+
+            if (event->size > 4 || event->size < 1) goto bad_argument;
+
+            for (i = 0; i < event->size; i++) if (TYPEOF(ITEM(event)[i]) != PIKE_T_INT) goto bad_argument;
+
+            memset(&ev, 0, sizeof(ev));
+
+            ev.control = ITEM(event)[0].u.integer;
+
+            switch (ev.control) {
+            case 0x80: // note on
+            case 0x90: // note off
+            case 0xa0: // polyphonic key pressure
+            case 0xb0: // control change
+                if (event->size != 4) goto bad_argument;
+                ev.control |= ITEM(event)[1].u.integer & 0xf;
+                ev.data[0] = ITEM(event)[2].u.integer;
+                ev.data[1] = ITEM(event)[3].u.integer;
+                break;
+            case 0xc0: // program change
+            case 0xd0: // channel pressure
+                if (event->size != 3) goto bad_argument;
+                ev.control |= ITEM(event)[1].u.integer & 0xf;
+                ev.data[0] = ITEM(event)[2].u.integer;
+                break;
+            case 0xe0: // pitch bend
+                {
+                    unsigned INT_TYPE pitch;
+
+                    if (event->size != 3) goto bad_argument;
+
+                    ev.control |= ITEM(event)[1].u.integer & 0xf;
+                    pitch = ITEM(event)[2].u.integer;
+                    
+                    if (pitch > (1<<14)-1) goto bad_argument;
+
+                    ev.data[0] = pitch & 0x7f;
+                    ev.data[1] = pitch >> 7;
+                }
+                break;
+            case 0xf0: // system exclusive
+                break;
+            default: goto bad_argument;
+            }
+
+            if (jack_ringbuffer_write(THIS->rb, (char*)&ev, sizeof(ev)) < sizeof(ev)) {
+                Pike_error("Buffer overrun. Too many events in ringbuffer.\n");
+            }
+
+            return;
+            bad_argument:
+                Pike_error("Invalid argument.\n");
+        }
+    }
+
+    PIKECLASS MidiIn 
+        program_flags PROGRAM_USES_PARENT|PROGRAM_NEEDS_PARENT;
+    {
+        CVAR jack_port_t *port;
+        CVAR jack_client_t *client;
+        CVAR jack_ringbuffer_t *rb;
+        CVAR struct port_handler *port_handle;
+
+#cmod_include "jack_midi_port.H"
+
+        static jack_nframes_t midi_in_processing(jack_nframes_t nframes, void *arg) {
+            struct Client_MidiIn_struct *P = arg;
+            void *port_buffer = jack_port_get_buffer(P->port, nframes);
+            jack_nframes_t event_count = jack_midi_get_event_count(port_buffer);
+            jack_nframes_t i;
+
+            for (i = 0; i < event_count; i++) {
+                jack_midi_event_t in_event;
+                struct midi_event ev;
+
+                jack_midi_event_get(&in_event, port_buffer, i);
+
+                if (in_event.size <= sizeof(struct midi_event)) {
+                    memset(&ev, 0, sizeof(ev));
+                    
+                    memcpy(&ev, in_event.buffer, in_event.size);
+
+                    if (jack_ringbuffer_write(P->rb, (char *)&ev, sizeof(ev)) < sizeof(ev)) {
+                        /* TODO: try better error handling here */
+                        fprintf(stderr, "Not enough space in ringbuffer.\n");
+                    }
+                }
+            }
+
+            return event_count;
+        }
+
+        PIKEFUN void create(string port_name, void|int flags, void|int(0..) buffer_size) {
+            jack_port_t *port;
+            struct Client_struct *c = find_client_struct();
+            jack_client_t *client = c->handle;
+
+            if (!THIS->rb) Pike_error("Out of memory.\n");
+
+            if (!client) Pike_error("Cannot create port in disconnected client.\n");
+
+            port = jack_port_register(client, port_name->str, JACK_DEFAULT_MIDI_TYPE,
+                                      JackPortIsInput, buffer_size ? buffer_size->u.integer : 0);
+
+            if (!port) Pike_error("Failed to create port.\n");
+
+            THIS->port = port;
+            THIS->client = client;
+            THIS->port_handle = client_add_port(c, midi_in_processing, THIS);
+        }
+
+        PIKEFUN int _sizeof() {
+            push_int(jack_ringbuffer_read_space(THIS->rb)/sizeof(struct midi_event));
+        }
+
+        static void push_midi_event(struct midi_event ev) {
+            unsigned char channel, type;
+            struct array *ret;
+
+            type = ev.control & 0xf0;
+            channel = ev.control & 0xf;
+
+            switch (type) {
+            case 0x80: // note on
+            case 0x90: // note off
+            case 0xa0: // polyphonic key pressure
+            case 0xb0: // control change
+                ret = allocate_array(4);
+                ITEM(ret)[0].u.integer = type;
+                ITEM(ret)[1].u.integer = channel;
+                ITEM(ret)[2].u.integer = ev.data[0];
+                ITEM(ret)[3].u.integer = ev.data[1];
+                break;
+            case 0xc0: // program change
+            case 0xd0: // channel pressure
+                ret = allocate_array(3);
+                ITEM(ret)[0].u.integer = type;
+                ITEM(ret)[1].u.integer = channel;
+                ITEM(ret)[2].u.integer = ev.data[0];
+                break;
+            case 0xe0: // pitch bend
+                ret = allocate_array(3);
+                ITEM(ret)[0].u.integer = type;
+                ITEM(ret)[1].u.integer = channel;
+                ITEM(ret)[2].u.integer = ev.data[0] | (unsigned short)ev.data[1] << 7;
+                break;
+            case 0xf0: // system exclusive
+                ret = allocate_array(1);
+                ITEM(ret)[0].u.integer = ev.control;
+                break;
+            }
+
+            push_array(ret);
+        }
+
+        PIKEFUN array try_read() {
+            struct midi_event ev;
+
+            if (jack_ringbuffer_read(THIS->rb, (char*)&ev, sizeof(ev)) == sizeof(ev)) {
+                push_midi_event(ev);
+            } else {
+                push_undefined();
+            }
+        }
+
+        PIKEFUN array read() {
+            struct Client_MidiIn_struct *this = THIS;
+            while (1) {
+                struct Client_struct *c;
+                struct midi_event ev;
+
+                if (jack_ringbuffer_read(this->rb, (char*)&ev, sizeof(ev)) == sizeof(ev)) {
+                    push_midi_event(ev);
+                    return;
+                }
+
+                c = find_client_struct();
+
+                if (!c) Pike_error("Lost client.\n");
+
+                SWAP_OUT_CURRENT_THREAD();
+                co_wait_interpreter(&c->reader_cond);
+                SWAP_IN_CURRENT_THREAD();
+            }
+        }
+    }
+}
+
+static void error_callback(const char * msg) {
+    fprintf(stderr, "ERROR: %s\n", msg);
+    fflush(stderr);
+}
+
+PIKE_MODULE_INIT {
+    INIT;
+
+    jack_set_error_function(error_callback);
+
+    /* jack_status_t bits */
+#define CASE(x) add_integer_constant(#x, x, 0)
+    CASE(JackFailure);
+    CASE(JackInvalidOption);
+    CASE(JackNameNotUnique);
+    CASE(JackServerStarted);
+    CASE(JackServerFailed);
+    CASE(JackServerError);
+    CASE(JackNoSuchClient);
+    CASE(JackLoadFailure);
+    CASE(JackInitFailure);
+    CASE(JackShmFailure);
+    CASE(JackVersionError);
+    CASE(JackBackendError);
+    CASE(JackClientZombie);
+
+    /* jack port flags */
+    CASE(JackPortIsInput);
+    CASE(JackPortIsOutput);
+    CASE(JackPortIsPhysical);
+    CASE(JackPortCanMonitor);
+    CASE(JackPortIsTerminal);
+#undef CASE
+}
+
+PIKE_MODULE_EXIT {
+    EXIT;
+}
+
+#endif
+
+/*! @endmodule */
