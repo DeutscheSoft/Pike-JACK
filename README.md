@@ -14,6 +14,8 @@ passes all data from and to Pike using a ringbuffer. This ringbuffer has
 a fixed size and it is therefore important to process incoming MIDI events
 fast enough to prevent buffer overruns.
 
+This module requires Pike 8.
+
 # License
 
 This module is licensed under the GPLv2.
