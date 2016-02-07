@@ -214,15 +214,6 @@ PIKECLASS Client
         return get_storage(loc.o, Client_program);
     }
 
-    static jack_client_t *find_client_handle() {
-        jack_client_t *client;
-        struct Client_struct *c = find_client_struct();
-
-        if (c) return c->handle;
-
-        return NULL;
-    }
-
     PIKECLASS Port
         program_flags PROGRAM_USES_PARENT|PROGRAM_NEEDS_PARENT;
     {
@@ -472,6 +463,8 @@ PIKECLASS Client
                 ret = allocate_array(1);
                 ITEM(ret)[0].u.integer = ev.control;
                 break;
+            default:
+                Pike_error("Error in internal MIDI processing. Unknown type %x.\n", type);
             }
 
             push_array(ret);
