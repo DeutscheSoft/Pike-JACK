@@ -37,6 +37,7 @@ struct midi_event {
     unsigned char data[2];
 };
 
+DECLARATIONS
 PIKECLASS Client
     program_flags PROGRAM_USES_PARENT|PROGRAM_NEEDS_PARENT;
 {
