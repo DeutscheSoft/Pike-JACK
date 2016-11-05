@@ -38,13 +38,18 @@ struct midi_event {
 };
 
 DECLARATIONS
+
+#if defined(MUTEX_T) && !defined(PIKE_MUTEX_T)
+# define PIKE_MUTEX_T MUTEX_T
+#endif
+
 PIKECLASS Client
     program_flags PROGRAM_USES_PARENT|PROGRAM_NEEDS_PARENT;
 {
     CVAR jack_client_t *handle;
     CVAR size_t num_ports;
     CVAR struct port_handler * ports;
-    CVAR MUTEX_T ports_lock;
+    CVAR PIKE_MUTEX_T ports_lock;
     CVAR COND_T reader_cond;
 
     INIT {
